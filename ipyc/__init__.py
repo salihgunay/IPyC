@@ -22,10 +22,8 @@ __path__ = __import__('pkgutil').extend_path(__path__, __name__)
 from collections import namedtuple
 import logging
 
-from .blocking import IPyCHost, IPyCMaster, IPyCClient, IPyCSlave
-from .asynchronous import AsyncIPyCHost, AsyncIPyCMaster, AsyncIPyCClient, AsyncIPyCSlave
-from .links import IPyCLink, AsyncIPyCLink
-from . import serialization as IPyCSerialization
+from .asynchronous import AsyncIPyCHost, AsyncIPyCClient
+from .links import AsyncIPyCLink
 
 VersionInfo = namedtuple('VersionInfo', 'major minor micro releaselevel serial')
 version_info = VersionInfo(major=1, minor=1, micro=1, releaselevel='release', serial=0)

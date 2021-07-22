@@ -3,8 +3,29 @@ import logging
 import signal
 import sys
 import datetime
+from itertools import count
+from .links import AsyncIPyCLink, MessageObject
 
-from .links import AsyncIPyCLink
+MAX_MSG_ID = 2 ** 32
+
+
+class Proxy:
+    def __init__(self, link: AsyncIPyCLink):
+        self._link = link
+        self._iter = count()
+
+    @property
+    def _next_message_id(self) -> int:
+        message_id = next(self._iter)
+        if message_id > MAX_MSG_ID:
+            self._iter = count()
+        return message_id
+
+    def __getattr__(self, function_name):
+        async def func(*args, **kwargs):
+            message_object = MessageObject(function_name, self._next_message_id, *args, *kwargs)
+            return await self._link.send(message_object)
+        return func
 
 
 class AsyncIPyCHost:
@@ -31,7 +52,8 @@ class AsyncIPyCHost:
     loop: :class:`asyncio.AbstractEventLoop`
         The event loop that the client uses for asynchronous events.
     """
-    def __init__(self, ip_address: str='localhost', port:  int=9999, loop=None):
+    def __init__(self, klass, ip_address: str='localhost', port:  int=9999, loop=None):
+        self.klass = klass
         self._ip_address = ip_address
         self._port = port
         self._logger = logging.getLogger(self.__class__.__name__)
@@ -242,11 +264,6 @@ class AsyncIPyCHost:
         self._on_close.set()
 
 
-class AsyncIPyCMaster(AsyncIPyCHost):
-    """Pseudo-class for AsyncIPyCHost"""
-    pass
-
-
 class AsyncIPyCClient:
     """Represents an abstracted async socket client that connects to
     and communicates with :class:`AsyncIPyCHost` hosts.
@@ -279,8 +296,9 @@ class AsyncIPyCClient:
             'connect': []
         }
         self._read_task = None
+        self.proxy = None
 
-    async def connect(self, *args) -> AsyncIPyCLink:
+    async def connect(self):
         """|coro|
 
         A shorthand coroutine for :func:`asyncio.open_connection`. Any
@@ -292,10 +310,10 @@ class AsyncIPyCClient:
         :class:`AsyncIPyCLink`
             The connection that has been established with a :class:`AsyncIPyCHost`.
         """
-        reader, writer = await asyncio.open_connection(host=self._ip_address, port=self._port, loop=self.loop, *args)
+        reader, writer = await asyncio.open_connection(host=self._ip_address, port=self._port, loop=self.loop)
         self._link = AsyncIPyCLink(reader, writer, self)
-        self._read_task = asyncio.create_task(self._link.rec())
-        return self._link
+        self._read_task = asyncio.create_task(self._link.start_listening())
+        self.proxy = Proxy(self._link)
 
     async def close(self):
         """|coro|

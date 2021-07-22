@@ -3,22 +3,20 @@ import datetime
 
 from ipyc import AsyncIPyCHost, AsyncIPyCLink
 
-host = AsyncIPyCHost()
 # logging.basicConfig(level=logging.DEBUG)
 
-"""
-@host.on_connect
-async def on_connection(connection: AsyncIPyCLink):
-    connection_idx = len(host.connections)
 
-    print(f'We got a new connection! ({connection_idx})')
-    while connection.is_active():
-        message = await connection.receive()
-        print("here", message)
-        if message:
-            print(f"[{datetime.datetime.now()}] - Connection {connection_idx} says: {message}")
-    print(f"[{datetime.datetime.now()}] - Connection {connection_idx} was closed!")
-"""
+class HelloTest:
+    def call_me(self, *args, **kwargs):
+        print("you called me", args, kwargs)
+
+    async def async_call_me(self):
+        print("you called me asyncly")
+        return "I am ok"
+
+
+hello_test = HelloTest()
+host = AsyncIPyCHost(klass=hello_test)
 
 
 print('Starting to wait for connections!')

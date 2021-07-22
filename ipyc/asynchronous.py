@@ -2,6 +2,7 @@ import asyncio
 import logging
 import signal
 import sys
+import datetime
 
 from .links import AsyncIPyCLink
 
@@ -46,8 +47,20 @@ class AsyncIPyCHost:
     async def __handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         new_connection = AsyncIPyCLink(reader, writer, self)
         self.connections.add(new_connection)
+        await self.on_connection(new_connection)
+        return
         for handle in self._handlers['connect']:
             await handle(new_connection)
+
+    async def on_connection(self, connection: AsyncIPyCLink):
+        connection_idx = len(self.connections)
+
+        print(f'We got a new connection! ({connection_idx})')
+        while connection.is_active():
+            message = await connection.receive()
+            if message:
+                print(f"[{datetime.datetime.now()}] - Connection {connection_idx} says: {message}")
+        print(f"[{datetime.datetime.now()}] - Connection {connection_idx} was closed!")
 
     def _cleanup_loop(self, loop):
         try:
@@ -265,6 +278,7 @@ class AsyncIPyCClient:
         self._handlers = {
             'connect': []
         }
+        self._read_task = None
 
     async def connect(self, *args) -> AsyncIPyCLink:
         """|coro|
@@ -280,6 +294,7 @@ class AsyncIPyCClient:
         """
         reader, writer = await asyncio.open_connection(host=self._ip_address, port=self._port, loop=self.loop, *args)
         self._link = AsyncIPyCLink(reader, writer, self)
+        self._read_task = asyncio.create_task(self._link.rec())
         return self._link
 
     async def close(self):
@@ -289,6 +304,9 @@ class AsyncIPyCClient:
         """
         if self._closed:
             return
+        if self._read_task:
+            self._read_task.cancel()
+            self._read_task = None
         self._closed = True
         await self._link.close()
         self._link = None

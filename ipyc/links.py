@@ -1,11 +1,29 @@
 import asyncio
 import logging
 import sys
+from itertools import count
+from pickle import loads, dumps
+from typing import Dict
 
 from multiprocessing.connection import Connection
 
 from .packets import CommunicationPacket
 from . import serialization
+MAX_MSG_ID = 2 ** 32
+
+
+class MessageObject:
+    def __init__(self, data, message_id: int):
+        self._data = data
+        self._message_id = message_id
+
+    @property
+    def data(self):
+        return self._data
+
+    @property
+    def message_id(self) -> int:
+        return self._message_id
 
 
 class IPyCLink:
@@ -71,17 +89,7 @@ class IPyCLink:
         if not self.is_active():
             self._logger.debug(f"Attempted to send data when the link is closed! Ignoring.")
             return
-
-        if type(serializable_object).__name__ not in serialization.IPYC_CUSTOM_SERIALIZATIONS:
-            self._logger.debug(f"Serializing {type(serializable_object).__name__} as a default python type")
-            serialized_string = str(serializable_object)
-        else:
-            self._logger.debug(f"Serializing {type(serializable_object).__name__} using a custom defined serialization")
-            serialized_string = serialization.IPYC_CUSTOM_SERIALIZATIONS[type(serializable_object).__name__](serializable_object)
-
-        packet = CommunicationPacket(type(serializable_object).__name__, serialized_string)
-        self._logger.debug(f"Sending {len(packet.object_serialization)} bytes of '{packet.class_name}'")
-        self._connection.send(packet.construct(encoding=encoding))
+        self._connection.send(dumps(serializable_object))
 
     def receive(self, encoding='utf-8', return_on_error=False):
         """Receive a serializable object from the other end. If the object is not a custom
@@ -118,7 +126,7 @@ class IPyCLink:
             self._logger.debug(f"The downstream connection was aborted")
             self.close()
             return None
-        packet = CommunicationPacket.extract(data, encoding=encoding)
+        packet = loads(data)
         while not packet and not return_on_error:
             self._logger.debug(f"Packet received was not a valid communication packet... waiting for another")
             if self._connection.closed:
@@ -186,6 +194,8 @@ class AsyncIPyCLink:
         self._logger.debug(f"Established link")
         self._active = True
         self._client = client
+        self._iter = count()
+        self._tasks: [Dict, asyncio.Future] = {}
 
     async def close(self):
         """|coro|
@@ -217,7 +227,7 @@ class AsyncIPyCLink:
             self._active = False
         return self._active
 
-    async def send(self, serializable_object: object, drain_immediately=True, encoding='utf-8'):
+    async def send(self, data, drain_immediately=True):
         """|coro|
 
         Send a serializable object to the receiving end. If the object is not a custom
@@ -247,20 +257,29 @@ class AsyncIPyCLink:
         if not self.is_active():
             self._logger.debug(f"Attempted to send data when the writer or link is closed! Ignoring.")
             return
+        message_object = self._create_message_object(data)
+        packet = dumps(message_object) + b'salih'
 
-        if type(serializable_object).__name__ not in serialization.IPYC_CUSTOM_SERIALIZATIONS:
-            self._logger.debug(f"Serializing {type(serializable_object).__name__} as a default python type")
-            serialized_string = str(serializable_object)
-        else:
-            self._logger.debug(f"Serializing {type(serializable_object).__name__} using a custom defined serialization")
-            serialized_string = serialization.IPYC_CUSTOM_SERIALIZATIONS[type(serializable_object).__name__](serializable_object)
-
-        packet = CommunicationPacket(type(serializable_object).__name__, serialized_string)
-        self._logger.debug(f"Sending {len(packet.object_serialization)} bytes of '{packet.class_name}'")
-        self._writer.write(packet.construct(encoding=encoding))
+        self._writer.write(packet)
         if drain_immediately:
             self._logger.debug(f"Draining the writer")
             await self._writer.drain()
+
+        task = asyncio.Future()
+        self._tasks[message_object.message_id] = task
+        return await task
+
+    def _create_message_object(self, data) -> MessageObject:
+        message_id = next(self._iter)
+        if message_id > MAX_MSG_ID:
+            self._iter = count()
+        return MessageObject(data, message_id=message_id)
+
+    async def rec(self):
+        print("rec started")
+        while self.is_active():
+            await self.receive()
+
 
     async def receive(self, encoding='utf-8', return_on_error=False):
         """|coro|
@@ -290,17 +309,24 @@ class AsyncIPyCLink:
         """
         if not self.is_active():
             self._logger.debug(f"Attempted to read data when the writer or link is closed! Returning nothing.")
-            return None
+            return
 
         self._logger.debug(f"Waiting for communication from the other side")
         try:
-            data = await self._reader.readline()
+            data = await self._reader.readuntil(separator=b'salih')
         except ConnectionAbortedError:
             self._logger.debug(f"The downstream connection was aborted")
             await self.close()
-            return None
-        packet = CommunicationPacket.extract(data, encoding=encoding)
-        while not packet and not return_on_error:
+            return
+        except asyncio.exceptions.IncompleteReadError:
+            self._logger.debug(f'Read canceled for incomplete read error')
+            await self.close()
+            return
+        message_object: MessageObject = loads(data[:-5])
+        if not isinstance(message_object, MessageObject):
+            raise Exception("Not Message Object Recieved")
+
+        while not message_object:
             self._logger.debug(f"Packet received was not a valid communication packet... waiting for another")
             if self._reader.at_eof():
                 self._logger.debug(f"The downstream writer closed the connection")
@@ -312,17 +338,16 @@ class AsyncIPyCLink:
                 self._logger.debug(f"The downstream connection was aborted")
                 await self.close()
                 return None
-            packet = CommunicationPacket.extract(data, encoding=encoding)
+            packet = loads(data)
         if self._reader.at_eof():
             self._logger.debug(f"The downstream writer closed the connection")
             await self.close()
             return None
-        if not packet:
+        if not message_object:
             self._logger.debug(f"Packet received was not a valid communication packet, return_on_error was set to true. Returning.")
             return None
-
-        self._logger.debug(f"Received {len(packet.object_serialization)} bytes of '{packet.class_name}'")
-        if packet.class_name not in serialization.IPYC_CUSTOM_DESERIALIZATIONS:
-            return eval(packet.class_name)(packet.object_serialization)
+        if self._client.__class__.__name__ == "AsyncIPyCHost":
+            self._writer.write(data)
         else:
-            return serialization.IPYC_CUSTOM_DESERIALIZATIONS[packet.class_name](packet.object_serialization)
+            task = self._tasks.pop(message_object.message_id)
+            task.set_result(message_object.data)
